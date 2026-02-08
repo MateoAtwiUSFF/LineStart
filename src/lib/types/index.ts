@@ -331,7 +331,7 @@ export type CreateUserInput = Omit<User, 'uid' | 'createdAt' | 'modifiedAt'>;
 /**
  * Type for creating a new job (without generated fields)
  */
-export type CreateJobInput = Omit<Job, 'id' | 'createdAt' | 'modifiedAt' | 'status'>;
+export type CreateJobInput = Omit<Job, 'id' | 'createdAt' | 'modifiedAt' | 'status' | 'createdBy' | 'modifiedBy'>;
 
 /**
  * Type for creating a new resource (without generated fields)
