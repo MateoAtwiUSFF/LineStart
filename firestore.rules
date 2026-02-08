@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && getUserData().role == 'admin';
+    }
+
+    function isPM() {
+      return isAuthenticated() &&
+             (getUserData().role == 'pm' || getUserData().role == 'admin');
+    }
+
+    function isRO() {
+      return isAuthenticated() && getUserData().role == 'ro';
+    }
+
+    // Users: Admin full access, PM can create/manage ROs only
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAdmin() ||
+                      (isPM() && request.resource.data.role == 'ro');
+      allow update: if isAdmin() ||
+                      (isPM() && resource.data.role == 'ro' && request.resource.data.role == 'ro');
+      allow delete: if isAdmin() ||
+                      (isPM() && resource.data.role == 'ro');
+    }
+
+    // Jobs: PM full access, all can read
+    match /jobs/{jobId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isPM();
+
+      // Work Orders: PM full access, RO can update restricted fields only
+      match /workOrders/{workOrderId} {
+        allow read: if isAuthenticated();
+        allow create, delete: if isPM();
+        allow update: if isPM() ||
+                        (isRO() &&
+                         resource.data.status in ['queued', 'active', 'paused'] &&
+                         request.resource.data.diff(resource.data).affectedKeys()
+                           .hasOnly(['status', 'quantityCompleted', 'startedBy', 'startedAt', 'completedBy', 'completedAt']));
+
+        // Time Entries: RO and PM can create and update
+        match /timeEntries/{entryId} {
+          allow read: if isAuthenticated();
+          allow create, update: if isRO() || isPM();
+        }
+      }
+
+      // Audit Log References: all can read, all can create, nobody can update or delete
+      match /auditLog/{logId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated();
+        allow update, delete: if false;
+      }
+    }
+
+    // Resources: PM full access, RO can only update currentDowntime
+    match /resources/{resourceId} {
+      allow read: if isAuthenticated();
+      allow create, delete: if isPM();
+      allow update: if isPM() ||
+                      (isRO() &&
+                       request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['currentDowntime']));
+
+      // Assigned Work Orders subcollection
+      match /assignedWorkOrders/{assignmentId} {
+        allow read: if isAuthenticated();
+        allow create, update, delete: if isPM();
+      }
+
+      // Scheduled Downtime
+      match /scheduledDowntime/{downtimeId} {
+        allow read: if isAuthenticated();
+        allow create, update, delete: if isPM();
+      }
+    }
+
+    // Global Audit Logs: PM can read, all can create, nobody can update or delete
+    match /auditLogs/{logId} {
+      allow read: if isPM();
+      allow create: if isAuthenticated();
+      allow update, delete: if false;
+    }
+
+    // Gantt Entries: all can read, only Cloud Functions should write (admin SDK bypasses rules)
+    match /ganttEntries/{entryId} {
+      allow read: if isAuthenticated();
+      allow write: if false;  // Only written by Cloud Functions via Admin SDK
+    }
+
+    // Configuration: all can read, PM can write
+    match /configuration/{configId} {
+      allow read: if isAuthenticated();
+      allow write: if isPM();
+    }
+  }
+}
