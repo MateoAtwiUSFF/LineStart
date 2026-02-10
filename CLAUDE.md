@@ -232,3 +232,17 @@ Before implementing any feature, check `docs/FUTURE_FEATURES.md`. The following 
 - Resource-operator access restrictions (all ROs can access all resources in MVP)
 
 If a task seems to require one of these features, stop and ask before implementing.
+
+---
+
+## Deployment
+
+**IMPORTANT: Only deploy to Firebase when explicitly instructed to do so.**
+
+Do not run `firebase deploy` commands unless the user specifically requests deployment. This includes:
+- `firebase deploy --only hosting`
+- `firebase deploy --only functions`
+- `firebase deploy --only firestore:rules`
+- `firebase deploy` (full deployment)
+
+Always build and test locally first. Wait for explicit user approval before deploying to production.

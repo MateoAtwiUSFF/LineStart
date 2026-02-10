@@ -3,23 +3,99 @@
 	import { currentUser, isPM } from '$lib/stores/auth';
 	import { jobsStore, filteredJobs, jobsLoading } from '$lib/stores/jobs';
 	import { configStore, config, customFields } from '$lib/stores/config';
+	import { resourcesStore, resources } from '$lib/stores/resources';
+	import { importJobsFromCSV, exportJobsToCSV, downloadCSV } from '$lib/utils/csv';
+	import { calculateDuration } from '$lib/utils/calculations';
+	import {
+		createWorkOrder,
+		addAssignedWorkOrder,
+		updateJob,
+		getAllResources,
+		getWorkOrdersForJob
+	} from '$lib/utils/firestore';
+	import { Timestamp } from 'firebase/firestore';
+	import type { CreateWorkOrderInput, Resource, Job } from '$lib/types';
+	import { WorkOrderType, WorkOrderStatus, Priority, JobStatus } from '$lib/types';
+	import ViewJobModal from '$lib/components/pq/ViewJobModal.svelte';
 
 	// Load data on mount
 	onMount(async () => {
-		await configStore.load();
-		await jobsStore.load();
+		await Promise.all([
+			configStore.load(),
+			jobsStore.load(),
+			resourcesStore.load(),
+			loadResources()
+		]);
+		await loadJobAssignments();
 	});
 
-	// State for new job form
+	// Load resources list (for dropdowns)
+	let allResources = $state<Resource[]>([]);
+
+	async function loadResources() {
+		try {
+			allResources = await getAllResources();
+		} catch (err: any) {
+			console.error('Error loading resources:', err);
+		}
+	}
+
+	// Load job-to-resource assignments
+	async function loadJobAssignments() {
+		const assignments = new Map<string, string[]>();
+
+		for (const job of $filteredJobs) {
+			if (job.status !== 'unassigned') {
+				try {
+					const workOrders = await getWorkOrdersForJob(job.id);
+					// Only show active work orders (queued, active, paused) - exclude completed/partial
+					const activeWorkOrders = workOrders.filter(
+						wo => wo.status === WorkOrderStatus.QUEUED ||
+						      wo.status === WorkOrderStatus.ACTIVE ||
+						      wo.status === WorkOrderStatus.PAUSED
+					);
+					const resourceUids = activeWorkOrders
+						.map((wo) => {
+							const resource = allResources.find((r) => r.id === wo.resourceId);
+							return resource?.uid;
+						})
+						.filter((uid): uid is string => uid !== undefined);
+
+					// Get unique resource UIDs
+					const uniqueUids = Array.from(new Set(resourceUids));
+					if (uniqueUids.length > 0) {
+						assignments.set(job.id, uniqueUids);
+					}
+				} catch (err) {
+					console.error(`Error loading assignments for job ${job.id}:`, err);
+				}
+			}
+		}
+
+		jobResourceAssignments = assignments;
+	}
+
+	// State
 	let showAddJob = $state(false);
+	let showImportCSV = $state(false);
+	let importStatus = $state<{ success: string[]; errors: Array<{ row: number; error: string }> } | null>(null);
+
 	let newJob = $state({
 		projectId: '',
 		quantity: 100,
 		customFieldValues: {} as Record<string, any>
 	});
 
-	// Filter
 	let filterText = $state('');
+	let csvFile: File | null = null;
+
+	// Batch assignment state
+	let pendingAssignments = $state<Map<string, string>>(new Map()); // Map<jobId, resourceId>
+	let showViewModal = $state(false);
+	let selectedJob = $state<Job | null>(null);
+
+	// Track which resources are assigned to each job
+	let jobResourceAssignments = $state<Map<string, string[]>>(new Map()); // Map<jobId, resourceUids[]>
 
 	// Handle filter
 	function handleFilter(e: Event) {
@@ -54,15 +130,160 @@
 		}
 	}
 
+	// Handle CSV file selection
+	function handleFileSelect(e: Event) {
+		const input = e.target as HTMLInputElement;
+		csvFile = input.files?.[0] || null;
+	}
+
+	// Import CSV
+	async function handleImportCSV() {
+		if (!csvFile) {
+			alert('Please select a CSV file');
+			return;
+		}
+
+		try {
+			const csvContent = await csvFile.text();
+			const result = await importJobsFromCSV(csvContent, $config, $currentUser!.uid);
+
+			importStatus = result;
+
+			if (result.success.length > 0) {
+				await jobsStore.refresh();
+			}
+
+			// Auto-close if all succeeded
+			if (result.errors.length === 0) {
+				setTimeout(() => {
+					showImportCSV = false;
+					importStatus = null;
+					csvFile = null;
+				}, 2000);
+			}
+		} catch (error) {
+			console.error('Error importing CSV:', error);
+			alert('Failed to import CSV');
+		}
+	}
+
+	// Export CSV
+	function handleExportCSV() {
+		const csvContent = exportJobsToCSV($filteredJobs, $config);
+		const timestamp = new Date().toISOString().split('T')[0];
+		downloadCSV(csvContent, `linestart-jobs-${timestamp}.csv`);
+	}
+
 	// Get status color
 	function getStatusColor(status: string): string {
 		const state = $config.defaultStates.find((s) => s.name.toLowerCase() === status.toLowerCase());
 		return state?.color || '#6B7280';
 	}
 
-	// Refresh jobs
+	// Refresh
 	async function handleRefresh() {
 		await jobsStore.refresh();
+		await loadJobAssignments();
+	}
+
+	// Handle assignment dropdown change
+	function handleAssignmentChange(jobId: string, resourceId: string) {
+		if (resourceId === '') {
+			// User selected "Select resource..." (empty) - remove assignment
+			pendingAssignments.delete(jobId);
+		} else {
+			// User selected a resource - add to pending
+			pendingAssignments.set(jobId, resourceId);
+		}
+		// Trigger reactivity
+		pendingAssignments = new Map(pendingAssignments);
+	}
+
+	// Open ViewJobModal
+	function openViewModal(job: Job) {
+		selectedJob = job;
+		showViewModal = true;
+	}
+
+	// Close ViewJobModal
+	function closeViewModal() {
+		showViewModal = false;
+		selectedJob = null;
+	}
+
+	// Push all pending assignments
+	async function handlePushAssignments() {
+		if (pendingAssignments.size === 0) return;
+
+		try {
+			// For each pending assignment, create work order
+			for (const [jobId, resourceId] of pendingAssignments.entries()) {
+				// Get job details
+				const job = $filteredJobs.find((j) => j.id === jobId);
+				if (!job) continue;
+
+				// Get resource details for duration calculation
+				const resource = allResources.find((r) => r.id === resourceId);
+				if (!resource) continue;
+
+				// Calculate estimated duration
+				const estimatedDuration = calculateDuration(
+					resource.setupTime,
+					job.quantity,
+					resource.defaultProductionRate
+				);
+
+				// Create work order data
+				const workOrderData: CreateWorkOrderInput = {
+					jobId,
+					resourceId,
+					type: WorkOrderType.PRODUCTION,
+					priority: Priority.NORMAL,
+					status: WorkOrderStatus.QUEUED,
+					quantityTarget: job.quantity,
+					quantityCompleted: 0,
+					estimatedDuration,
+					scheduledStart: null,
+					assignedBy: $currentUser!.uid
+				};
+
+				// Create work order
+				const workOrderId = await createWorkOrder(jobId, workOrderData, $currentUser!.uid);
+
+				// Add to resource's assigned work orders
+				await addAssignedWorkOrder(resourceId, {
+					workOrderId,
+					jobId,
+					position: 0, // Add to front of queue
+					addedAt: Timestamp.now()
+				});
+
+				// Update job status to 'assigned'
+				await updateJob(jobId, { status: JobStatus.ASSIGNED }, $currentUser!.uid);
+			}
+
+			// Clear pending assignments
+			pendingAssignments.clear();
+			pendingAssignments = new Map();
+
+			// Refresh jobs
+			await jobsStore.refresh();
+
+			// Reload assignments to show updated resource assignments
+			await loadJobAssignments();
+		} catch (err: any) {
+			console.error('Error pushing assignments:', err);
+			alert(err.message || 'Failed to create work orders');
+		}
+	}
+
+	// Get assigned resources display text for a job
+	function getAssignedResourcesText(jobId: string): string {
+		const resourceUids = jobResourceAssignments.get(jobId);
+		if (!resourceUids || resourceUids.length === 0) {
+			return '—';
+		}
+		return resourceUids.join(', ');
 	}
 </script>
 
@@ -88,7 +309,7 @@
 			</div>
 
 			<!-- Actions -->
-			<div class="flex gap-2">
+			<div class="flex flex-wrap gap-2">
 				{#if $isPM}
 					<button
 						onclick={() => (showAddJob = true)}
@@ -96,7 +317,21 @@
 					>
 						+ Add Job
 					</button>
+
+					<button
+						onclick={() => (showImportCSV = true)}
+						class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium"
+					>
+						📁 Import CSV
+					</button>
 				{/if}
+
+				<button
+					onclick={handleExportCSV}
+					class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium"
+				>
+					📥 Export CSV
+				</button>
 
 				<button
 					onclick={handleRefresh}
@@ -104,6 +339,16 @@
 				>
 					🔄 Refresh
 				</button>
+
+				{#if $isPM}
+					<button
+						onclick={handlePushAssignments}
+						disabled={pendingAssignments.size === 0}
+						class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-400"
+					>
+						Push Assignments{#if pendingAssignments.size > 0} ({pendingAssignments.size}){/if}
+					</button>
+				{/if}
 			</div>
 		</div>
 	</div>
@@ -112,14 +357,14 @@
 	<div class="bg-white rounded-lg shadow overflow-hidden">
 		{#if $jobsLoading}
 			<div class="p-8 text-center">
-				<div
-					class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"
-				></div>
+				<div class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
 				<p class="mt-4 text-gray-600">Loading jobs...</p>
 			</div>
 		{:else if $filteredJobs.length === 0}
 			<div class="p-8 text-center">
-				<p class="text-gray-500">No jobs found. {$isPM ? 'Click "Add Job" to create one.' : ''}</p>
+				<p class="text-gray-500">
+					No jobs found. {$isPM ? 'Click "Add Job" or "Import CSV" to create jobs.' : ''}
+				</p>
 			</div>
 		{:else}
 			<div class="overflow-x-auto">
@@ -132,6 +377,13 @@
 							>
 								Project ID
 							</th>
+							{#if $isPM}
+								<th
+									class="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase tracking-wider"
+								>
+									Assign
+								</th>
+							{/if}
 							<th
 								class="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
 								onclick={() => handleSort('quantity')}
@@ -161,6 +413,24 @@
 						{#each $filteredJobs as job}
 							<tr class="hover:bg-gray-50 transition">
 								<td class="px-4 py-3 text-sm font-medium text-gray-900">{job.projectId}</td>
+								{#if $isPM}
+									<td class="px-4 py-3">
+										{#if job.status === 'unassigned'}
+											<select
+												value={pendingAssignments.get(job.id) || ''}
+												onchange={(e) => handleAssignmentChange(job.id, e.currentTarget.value)}
+												class="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+											>
+												<option value="">Select resource...</option>
+												{#each allResources as resource}
+													<option value={resource.id}>{resource.uid}</option>
+												{/each}
+											</select>
+										{:else}
+											<span class="text-sm text-gray-700">{getAssignedResourcesText(job.id)}</span>
+										{/if}
+									</td>
+								{/if}
 								<td class="px-4 py-3 text-sm text-gray-700">{job.quantity}</td>
 								<td class="px-4 py-3">
 									<span
@@ -175,8 +445,9 @@
 										{job.customFieldValues[field.name] || '-'}
 									</td>
 								{/each}
-								<td class="px-4 py-3 text-right text-sm">
+								<td class="px-4 py-3 text-right text-sm space-x-2">
 									<button
+										onclick={() => openViewModal(job)}
 										class="text-indigo-600 hover:text-indigo-900 font-medium"
 									>
 										View
@@ -200,20 +471,20 @@
 {#if showAddJob}
 	<div
 		class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
-		onclick={(e) => {
-			if (e.target === e.currentTarget) showAddJob = false;
-		}}
+		onclick={(e) => e.target === e.currentTarget && (showAddJob = false)}
+		role="dialog"
+		aria-modal="true"
 	>
 		<div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
 			<h2 class="text-2xl font-bold text-gray-900 mb-4">Add New Job</h2>
 
 			<form onsubmit={(e) => { e.preventDefault(); handleCreateJob(); }}>
-				<!-- Project ID -->
 				<div class="mb-4">
-					<label class="block text-sm font-medium text-gray-700 mb-2">
+					<label for="projectId" class="block text-sm font-medium text-gray-700 mb-2">
 						Project ID *
 					</label>
 					<input
+						id="projectId"
 						type="text"
 						bind:value={newJob.projectId}
 						required
@@ -222,12 +493,12 @@
 					/>
 				</div>
 
-				<!-- Quantity -->
 				<div class="mb-4">
-					<label class="block text-sm font-medium text-gray-700 mb-2">
+					<label for="quantity" class="block text-sm font-medium text-gray-700 mb-2">
 						Quantity *
 					</label>
 					<input
+						id="quantity"
 						type="number"
 						bind:value={newJob.quantity}
 						required
@@ -236,16 +507,16 @@
 					/>
 				</div>
 
-				<!-- Custom Fields -->
 				{#each $customFields as field}
 					<div class="mb-4">
-						<label class="block text-sm font-medium text-gray-700 mb-2">
+						<label for={field.name} class="block text-sm font-medium text-gray-700 mb-2">
 							{field.name}
 							{#if field.required}*{/if}
 						</label>
 
 						{#if field.type === 'string'}
 							<input
+								id={field.name}
 								type="text"
 								bind:value={newJob.customFieldValues[field.name]}
 								required={field.required}
@@ -253,6 +524,7 @@
 							/>
 						{:else if field.type === 'number'}
 							<input
+								id={field.name}
 								type="number"
 								bind:value={newJob.customFieldValues[field.name]}
 								required={field.required}
@@ -260,6 +532,7 @@
 							/>
 						{:else if field.type === 'date'}
 							<input
+								id={field.name}
 								type="date"
 								bind:value={newJob.customFieldValues[field.name]}
 								required={field.required}
@@ -267,6 +540,7 @@
 							/>
 						{:else if field.type === 'boolean'}
 							<input
+								id={field.name}
 								type="checkbox"
 								bind:checked={newJob.customFieldValues[field.name]}
 								class="w-4 h-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
@@ -275,7 +549,6 @@
 					</div>
 				{/each}
 
-				<!-- Actions -->
 				<div class="flex gap-3 mt-6">
 					<button
 						type="submit"
@@ -295,3 +568,92 @@
 		</div>
 	</div>
 {/if}
+
+<!-- Import CSV Modal -->
+{#if showImportCSV}
+	<div
+		class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+		onclick={(e) => e.target === e.currentTarget && (showImportCSV = false)}
+		role="dialog"
+		aria-modal="true"
+	>
+		<div class="bg-white rounded-lg shadow-xl max-w-lg w-full p-6">
+			<h2 class="text-2xl font-bold text-gray-900 mb-4">Import Jobs from CSV</h2>
+
+			{#if !importStatus}
+				<div class="mb-4">
+					<label for="csvFile" class="block text-sm font-medium text-gray-700 mb-2">
+						Select CSV File
+					</label>
+					<input
+						id="csvFile"
+						type="file"
+						accept=".csv"
+						onchange={handleFileSelect}
+						class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+					/>
+					<p class="mt-2 text-xs text-gray-500">
+						CSV should include: projectId, quantity, and any custom fields
+					</p>
+				</div>
+
+				<div class="flex gap-3 mt-6">
+					<button
+						onclick={handleImportCSV}
+						disabled={!csvFile}
+						class="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						Import
+					</button>
+					<button
+						onclick={() => {
+							showImportCSV = false;
+							csvFile = null;
+						}}
+						class="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition"
+					>
+						Cancel
+					</button>
+				</div>
+			{:else}
+				<!-- Import Results -->
+				<div class="space-y-4">
+					{#if importStatus.success.length > 0}
+						<div class="p-4 bg-green-50 border border-green-200 rounded-lg">
+							<p class="font-semibold text-green-800">
+								✅ Successfully imported {importStatus.success.length} job{importStatus.success.length !== 1 ? 's' : ''}
+							</p>
+						</div>
+					{/if}
+
+					{#if importStatus.errors.length > 0}
+						<div class="p-4 bg-red-50 border border-red-200 rounded-lg max-h-64 overflow-y-auto">
+							<p class="font-semibold text-red-800 mb-2">
+								❌ {importStatus.errors.length} error{importStatus.errors.length !== 1 ? 's' : ''}
+							</p>
+							<ul class="list-disc list-inside space-y-1 text-sm text-red-700">
+								{#each importStatus.errors as error}
+									<li>Row {error.row}: {error.error}</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+
+					<button
+						onclick={() => {
+							showImportCSV = false;
+							importStatus = null;
+							csvFile = null;
+						}}
+						class="w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition font-medium"
+					>
+						Close
+					</button>
+				</div>
+			{/if}
+		</div>
+	</div>
+{/if}
+
+<!-- View Job Modal -->
+<ViewJobModal bind:isOpen={showViewModal} job={selectedJob} onClose={closeViewModal} />

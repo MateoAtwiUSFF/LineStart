@@ -10,6 +10,7 @@ import {
 	getDoc,
 	getDocs,
 	addDoc,
+	setDoc,
 	updateDoc,
 	deleteDoc,
 	query,
@@ -65,7 +66,7 @@ export async function getAllUsers(): Promise<User[]> {
  * Create a new user
  */
 export async function createUser(uid: string, userData: CreateUserInput): Promise<void> {
-	await updateDoc(doc(db, 'users', uid), {
+	await setDoc(doc(db, 'users', uid), {
 		...userData,
 		uid,
 		createdAt: serverTimestamp(),
@@ -165,7 +166,7 @@ export async function addAssignedWorkOrder(
 	resourceId: string,
 	assignment: AssignedWorkOrder
 ): Promise<void> {
-	await updateDoc(
+	await setDoc(
 		doc(db, 'resources', resourceId, 'assignedWorkOrders', assignment.workOrderId),
 		{
 			...assignment,
@@ -324,14 +325,25 @@ export async function getWorkOrdersForJob(jobId: string): Promise<WorkOrder[]> {
 /**
  * Get work orders by resource
  */
-export async function getWorkOrdersForResource(
-	jobId: string,
-	resourceId: string
-): Promise<WorkOrder[]> {
-	const wosSnapshot = await getDocs(
-		query(collection(db, 'jobs', jobId, 'workOrders'), where('resourceId', '==', resourceId))
+export async function getWorkOrdersForResource(resourceId: string): Promise<WorkOrder[]> {
+	// Get assigned work order references from resource's subcollection
+	const assignedSnapshot = await getDocs(
+		collection(db, 'resources', resourceId, 'assignedWorkOrders')
 	);
-	return wosSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }) as WorkOrder);
+
+	// Fetch full work order details for each assignment
+	const workOrders: WorkOrder[] = [];
+	for (const assignedDoc of assignedSnapshot.docs) {
+		const assignment = assignedDoc.data();
+		const woDoc = await getDoc(
+			doc(db, 'jobs', assignment.jobId, 'workOrders', assignment.workOrderId)
+		);
+		if (woDoc.exists()) {
+			workOrders.push({ id: woDoc.id, ...woDoc.data() } as WorkOrder);
+		}
+	}
+
+	return workOrders;
 }
 
 /**
