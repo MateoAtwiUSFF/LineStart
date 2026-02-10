@@ -11,7 +11,9 @@
 		addAssignedWorkOrder,
 		updateJob,
 		getAllResources,
-		getWorkOrdersForJob
+		getWorkOrdersForJob,
+		deleteWorkOrder,
+		removeAssignedWorkOrder
 	} from '$lib/utils/firestore';
 	import { Timestamp } from 'firebase/firestore';
 	import type { CreateWorkOrderInput, Resource, Job } from '$lib/types';
@@ -285,6 +287,44 @@
 		}
 		return resourceUids.join(', ');
 	}
+
+	// Unassign a job
+	async function handleUnassign(job: Job) {
+		if (!confirm(`Are you sure you want to unassign job ${job.projectId}? This will delete all associated work orders.`)) {
+			return;
+		}
+
+		try {
+			// Get all work orders for this job
+			const workOrders = await getWorkOrdersForJob(job.id);
+
+			// Only delete active work orders (queued, active, paused)
+			const activeWorkOrders = workOrders.filter(
+				wo => wo.status === WorkOrderStatus.QUEUED ||
+				      wo.status === WorkOrderStatus.ACTIVE ||
+				      wo.status === WorkOrderStatus.PAUSED
+			);
+
+			// Delete each active work order
+			for (const wo of activeWorkOrders) {
+				// Remove from resource's assigned work orders
+				await removeAssignedWorkOrder(wo.resourceId, wo.id);
+
+				// Delete the work order itself
+				await deleteWorkOrder(job.id, wo.id);
+			}
+
+			// Update job status to unassigned
+			await updateJob(job.id, { status: JobStatus.UNASSIGNED }, $currentUser!.uid);
+
+			// Refresh data
+			await jobsStore.refresh();
+			await loadJobAssignments();
+		} catch (err: any) {
+			console.error('Error unassigning job:', err);
+			alert(err.message || 'Failed to unassign job');
+		}
+	}
 </script>
 
 <div class="container mx-auto px-4 py-8 max-w-7xl">
@@ -427,7 +467,19 @@
 												{/each}
 											</select>
 										{:else}
-											<span class="text-sm text-gray-700">{getAssignedResourcesText(job.id)}</span>
+											<div class="flex items-center gap-2">
+												<span class="text-sm text-gray-700">{getAssignedResourcesText(job.id)}</span>
+												<button
+													onclick={(e) => {
+														e.stopPropagation();
+														handleUnassign(job);
+													}}
+													class="text-red-600 hover:text-red-800 hover:bg-red-50 rounded px-1.5 py-0.5 transition text-sm font-bold"
+													title="Unassign job"
+												>
+													×
+												</button>
+											</div>
 										{/if}
 									</td>
 								{/if}
